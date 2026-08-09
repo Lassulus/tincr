@@ -153,13 +153,23 @@ impl PmtuState {
     }
 
     /// UDP-discovery timeout predicate. True iff a keepalive probe is
-    /// outstanding (`ping_sent`) AND was sent ≥ `timeout` ago. Checking
-    /// `udp_reply_rx` alone false-positives after an idle gap: `try_udp`
-    /// is the only keepalive sender and is itself data-driven, so a
-    /// silent period means *we* never probed, not that the path is dead.
+    /// outstanding (`ping_sent`) AND no reply has landed for `timeout`.
+    ///
+    /// C arms `udp_ping_timeout` in `udp_probe_h` — the deadline is
+    /// pushed forward by a probe *reply*, never by a probe *send*.
+    /// Measuring from `udp_ping_sent` instead
+    /// made the deadline unreachable: `try_udp` re-stamps `udp_ping_sent`
+    /// every `udp_discovery_keepalive_interval` (10s) whether or not the
+    /// peer answers, so a 30s timeout could never elapse and
+    /// `udp_confirmed` stayed pinned on a blackholed path forever (no
+    /// TCP fallback, no re-exploration of addresses, no LAN probe).
+    ///
+    /// The `ping_sent` gate is what keeps an idle gap from
+    /// false-positiving: `try_udp` is data-driven, so a silent period
+    /// means *we* never probed, not that the path is dead.
     #[must_use]
     pub(crate) fn udp_timed_out(&self, now: Instant, timeout: Duration) -> bool {
-        self.udp_confirmed && self.ping_sent && now.duration_since(self.udp_ping_sent) >= timeout
+        self.udp_confirmed && self.ping_sent && now.duration_since(self.udp_reply_rx) >= timeout
     }
 
     /// Restart discovery from scratch. Used by
@@ -174,7 +184,22 @@ impl PmtuState {
     /// Caller handles preconditions: PMTU discovery enabled,
     /// `udp_confirmed` if UDP discovery is on. The reset for
     /// not-confirmed is `on_udp_timeout`.
-    pub(crate) fn tick(&mut self, now: Instant, pinginterval: Duration) -> Vec<PmtuAction> {
+    ///
+    /// `initial_maxmtu` is `choose_initial_maxmtu`'s value, applied when
+    /// this tick is the one that *starts* a discovery cycle. It has to be
+    /// applied here, not hoisted into the caller: the `Lost` branch below
+    /// resets to `Discovery{0}` and the discovery arm consumes that state
+    /// within this same call, so a caller-side re-seed gated on
+    /// `is_discovery_start()` never observes it. Without it, a `maxmtu`
+    /// that `try_fix_mtu` collapsed to `minmtu == 0` (20 unanswered
+    /// probes) is absorbing: every later cycle instantly "converges" to
+    /// MTU 0 and the peer stays unusable forever.
+    pub(crate) fn tick(
+        &mut self,
+        now: Instant,
+        pinginterval: Duration,
+        initial_maxmtu: u16,
+    ) -> Vec<PmtuAction> {
         // Cadence gate.
         let elapsed = now.duration_since(self.mtu_ping_sent);
         match self.phase {
@@ -249,8 +274,14 @@ impl PmtuState {
             // Lost was reset above; Fix was consumed by try_fix_mtu.
             PmtuPhase::Lost | PmtuPhase::Fix => unreachable!(),
             PmtuPhase::Discovery { sent } => {
-                // maxmtu was seeded in new(); EMSGSIZE feedback arrives
-                // asynchronously, so send exactly one probe per tick.
+                // Re-seed maxmtu when a cycle starts, AFTER the Lost
+                // reset above — a stale (possibly zeroed) maxmtu must
+                // never survive into a new cycle.
+                if sent == 0 {
+                    self.maxmtu = initial_maxmtu;
+                }
+                // EMSGSIZE feedback arrives asynchronously, so send
+                // exactly one probe per tick.
                 let len = probe_size(self.minmtu, self.maxmtu, sent);
                 out.push(PmtuAction::SendProbe {
                     len: len.max(MIN_PROBE_SIZE),
@@ -502,7 +533,7 @@ mod tests {
     fn tick_discovery_advances_phase() {
         let now = t0();
         let mut s = PmtuState::new(now, MTU);
-        let out = s.tick(now, Duration::from_secs(60));
+        let out = s.tick(now, Duration::from_secs(60), MTU);
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0], PmtuAction::SendProbe { len } if (1329..=1330).contains(&len)));
         assert_eq!(s.phase, PmtuPhase::Discovery { sent: 1 });
@@ -512,11 +543,19 @@ mod tests {
     fn tick_gated_by_333ms() {
         let now = t0();
         let mut s = PmtuState::new(now, MTU);
-        s.tick(now, Duration::from_secs(60));
-        let out = s.tick(now + Duration::from_millis(100), Duration::from_secs(60));
+        s.tick(now, Duration::from_secs(60), MTU);
+        let out = s.tick(
+            now + Duration::from_millis(100),
+            Duration::from_secs(60),
+            MTU,
+        );
         assert!(out.is_empty());
         assert_eq!(s.phase, PmtuPhase::Discovery { sent: 1 });
-        let out = s.tick(now + Duration::from_millis(400), Duration::from_secs(60));
+        let out = s.tick(
+            now + Duration::from_millis(400),
+            Duration::from_secs(60),
+            MTU,
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(s.phase, PmtuPhase::Discovery { sent: 2 });
     }
@@ -528,12 +567,12 @@ mod tests {
         s.phase = PmtuPhase::Discovery { sent: 19 };
         s.minmtu = 1400;
         // Probe #19 → Fix.
-        let out = s.tick(now + Duration::from_secs(1), Duration::from_secs(60));
+        let out = s.tick(now + Duration::from_secs(1), Duration::from_secs(60), MTU);
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0], PmtuAction::SendProbe { .. }));
         assert_eq!(s.phase, PmtuPhase::Fix);
         // try_fix_mtu fires.
-        let out = s.tick(now + Duration::from_secs(2), Duration::from_secs(60));
+        let out = s.tick(now + Duration::from_secs(2), Duration::from_secs(60), MTU);
         assert_eq!(s.mtu, 1400);
         assert_eq!(s.maxmtu, 1400);
         // Fix → Steady (try_fix_mtu), then steady probe → Revalidate{1}.
@@ -672,9 +711,9 @@ mod tests {
         s.maxmtu = 1400;
         s.phase = PmtuPhase::Steady;
         s.mtu_ping_sent = now;
-        let out = s.tick(now + Duration::from_secs(30), Duration::from_secs(60));
+        let out = s.tick(now + Duration::from_secs(30), Duration::from_secs(60), MTU);
         assert!(out.is_empty());
-        let out = s.tick(now + Duration::from_secs(61), Duration::from_secs(60));
+        let out = s.tick(now + Duration::from_secs(61), Duration::from_secs(60), MTU);
         assert_eq!(
             out,
             vec![
@@ -693,7 +732,7 @@ mod tests {
         s.maxmtu = MTU - 1;
         s.minmtu = MTU - 1;
         s.phase = PmtuPhase::Steady;
-        let out = s.tick(now + Duration::from_secs(61), Duration::from_secs(60));
+        let out = s.tick(now + Duration::from_secs(61), Duration::from_secs(60), MTU);
         assert_eq!(out, vec![PmtuAction::SendProbe { len: MTU - 1 }]);
     }
 
@@ -707,20 +746,23 @@ mod tests {
         s.phase = PmtuPhase::Steady;
         s.udp_confirmed = true;
         let pi = Duration::from_secs(60);
-        s.tick(now + Duration::from_secs(61), pi);
+        s.tick(now + Duration::from_secs(61), pi, MTU);
         assert_eq!(s.phase, PmtuPhase::Revalidate { misses: 1 });
-        s.tick(now + Duration::from_secs(62), pi);
+        s.tick(now + Duration::from_secs(62), pi, MTU);
         assert_eq!(s.phase, PmtuPhase::Revalidate { misses: 2 });
-        s.tick(now + Duration::from_secs(63), pi);
+        s.tick(now + Duration::from_secs(63), pi, MTU);
         assert_eq!(s.phase, PmtuPhase::Lost);
         // Lost → reset
-        let out = s.tick(now + Duration::from_secs(64), pi);
+        let out = s.tick(now + Duration::from_secs(64), pi, MTU);
         assert!(out.contains(&PmtuAction::LogReset));
         // Reset to Discovery{0}, then discovery ran one probe → {1}.
         assert_eq!(s.phase, PmtuPhase::Discovery { sent: 1 });
         assert_eq!(s.minmtu, 0);
-        // The lost-reprobes reset does NOT touch maxmtu (on_udp_timeout does).
-        assert_eq!(s.maxmtu, 1400);
+        // The lost-reprobes reset doesn't touch maxmtu itself, but the
+        // discovery branch it falls into re-seeds it at cycle start.
+        // That re-arm is what stops a maxmtu collapsed to 0 from being
+        // an absorbing state.
+        assert_eq!(s.maxmtu, MTU);
     }
 
     // on_udp_timeout.
@@ -755,9 +797,9 @@ mod tests {
         let now = t0();
         let to = Duration::from_secs(30);
 
-        // Regression: idle gap, no probe outstanding. Old check
-        // (`udp_reply_rx` age) would have tripped here and zeroed
-        // minmtu → relay detour on a healthy path.
+        // Idle gap, no probe outstanding: the `ping_sent` gate keeps a
+        // stale `udp_reply_rx` from tripping a healthy-but-quiet path
+        // (try_udp is data-driven, so silence means we never probed).
         let mut s = PmtuState::new(now, MTU);
         s.udp_confirmed = true;
         s.ping_sent = false;
@@ -765,10 +807,16 @@ mod tests {
         s.udp_reply_rx = now; // 60s old at check time
         assert!(!s.udp_timed_out(now + Duration::from_secs(60), to));
 
-        // Probe outstanding, fresh.
+        // Probe outstanding. A fresh *send* must NOT hold the deadline
+        // open — only a reply does (C arms the timer in udp_probe_h).
         s.ping_sent = true;
         s.udp_ping_sent = now + Duration::from_secs(55);
+        assert!(s.udp_timed_out(now + Duration::from_secs(60), to));
+
+        // Fresh reply → deadline re-armed.
+        s.udp_reply_rx = now + Duration::from_secs(55);
         assert!(!s.udp_timed_out(now + Duration::from_secs(60), to));
+        s.udp_reply_rx = now;
 
         // Probe outstanding, stale.
         s.udp_ping_sent = now;
@@ -794,7 +842,7 @@ mod tests {
         assert!(s.maxmtu <= MTU);
         assert!(s.udp_confirmed);
         // And the Steady-phase increase-detector doesn't wrap:
-        let _ = s.tick(now, Duration::from_secs(5));
+        let _ = s.tick(now, Duration::from_secs(5), MTU);
     }
 
     #[test]
@@ -891,5 +939,104 @@ mod tests {
         assert!(PmtuPhase::Discovery { sent: 0 }.is_discovery_start());
         assert!(!PmtuPhase::Discovery { sent: 1 }.is_discovery_start());
         assert!(!PmtuPhase::Steady.is_discovery_start());
+    }
+
+    /// Regression: peer behind the same NAT, hairpin blackholes every
+    /// probe. Discovery burns 20 probes with `minmtu == 0`, so
+    /// `try_fix_mtu` executes `maxmtu = minmtu` → 0 (C parity — C does
+    /// this too). What must NOT happen is `maxmtu == 0` becoming
+    /// absorbing: the `Lost` branch resets `phase`/`minmtu` and the
+    /// discovery arm must re-seed `maxmtu` in the same tick, or every
+    /// later cycle instantly "converges" to MTU 0 and the node is dead
+    /// forever (observed in production: 201 `Fixing MTU to 0` per
+    /// 30 minutes for one peer, vs 1 for every healthy peer).
+    #[test]
+    fn blackholed_discovery_rearms_maxmtu() {
+        const SEED: u16 = 1400; // what choose_initial_maxmtu returned
+        let t = t0();
+        let pi = Duration::from_secs(60);
+        let mut s = PmtuState::new(t, SEED);
+        // Path was confirmed once, then the address flipped to the
+        // hairpin-NAT one and every probe is dropped from here on.
+        s.udp_confirmed = true;
+
+        let mut ms = 0_u64;
+        let tick = |s: &mut PmtuState, ms: &mut u64| {
+            *ms += 1000;
+            s.tick(t + Duration::from_millis(*ms), pi, SEED)
+        };
+
+        // 20 unanswered probes → Fix → mtu collapses to minmtu == 0.
+        let mut fixed_at = None;
+        for _ in 0..40 {
+            for a in tick(&mut s, &mut ms) {
+                if let PmtuAction::LogFixed { mtu, probes } = a {
+                    fixed_at = Some((mtu, probes));
+                }
+            }
+            if fixed_at.is_some() {
+                break;
+            }
+        }
+        assert_eq!(fixed_at, Some((0, 20)), "C-parity collapse to minmtu");
+        assert_eq!(s.maxmtu, 0, "try_fix_mtu zeroed maxmtu");
+
+        // Steady → Revalidate×2 → Lost → reset. The reset tick must put
+        // maxmtu back so the next cycle probes real sizes again.
+        let mut saw_reset = false;
+        for _ in 0..200 {
+            for a in tick(&mut s, &mut ms) {
+                if a == PmtuAction::LogReset {
+                    saw_reset = true;
+                }
+                // Between the collapse and the reset the only legal
+                // LogFixed is the one we already consumed.
+                assert!(
+                    !matches!(a, PmtuAction::LogFixed { .. }),
+                    "re-converged to a fixed MTU without re-arming maxmtu"
+                );
+            }
+            if saw_reset {
+                break;
+            }
+        }
+        assert!(saw_reset, "never reached the Lost reset");
+        assert_eq!(s.minmtu, 0);
+        assert_eq!(
+            s.maxmtu, SEED,
+            "maxmtu must be re-seeded on discovery restart, not left at 0"
+        );
+    }
+
+    /// Regression: `try_udp` re-stamps `udp_ping_sent` on every keepalive
+    /// *send* (10s) whether or not the peer answers. Deriving the
+    /// discovery timeout from that stamp made a 30s deadline unreachable,
+    /// so `udp_confirmed` stayed pinned on a blackholed path — no TCP
+    /// fallback, no address re-exploration, no LAN probe. C arms the
+    /// timeout from the probe *reply*.
+    #[test]
+    fn udp_timed_out_survives_unanswered_keepalives() {
+        let t = t0();
+        let timeout = Duration::from_secs(30);
+        let mut s = PmtuState::new(t, MTU);
+        s.udp_confirmed = true;
+        s.udp_reply_rx = t; // last reply we ever got
+
+        // Six keepalive sends, 10s apart, all unanswered.
+        for i in 1..=6_u64 {
+            let now = t + Duration::from_secs(i * 10);
+            s.udp_ping_sent = now;
+            s.ping_sent = true;
+            if i * 10 < 30 {
+                assert!(!s.udp_timed_out(now, timeout), "tripped early at {i}0s");
+            } else {
+                assert!(s.udp_timed_out(now, timeout), "never trips at {i}0s");
+            }
+        }
+
+        // A reply re-arms the deadline.
+        let reply_at = t + Duration::from_secs(60);
+        let _ = s.on_probe_reply(1400, reply_at);
+        assert!(!s.udp_timed_out(reply_at + Duration::from_secs(29), timeout));
     }
 }

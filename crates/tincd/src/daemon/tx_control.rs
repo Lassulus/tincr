@@ -311,12 +311,18 @@ impl Daemon {
             // same path the actual probe send will use). If there's
             // no UDP addr yet the probe wouldn't go anywhere either
             // — fall back to MTU and let the next try_tx pick it up.
+            //
+            // `Lost` counts as "needs seed": that tick resets to
+            // `Discovery{0}` and sends its first probe in one call, so
+            // the seed has to be in hand before `tick` runs. `tick`
+            // itself applies it — doing it here would
+            // miss the reset it performs internally.
             let needs_seed = self
                 .dp
                 .tunnels
                 .get(&target)
                 .and_then(|t| t.pmtu.as_ref())
-                .is_none_or(|p| p.phase.is_discovery_start());
+                .is_none_or(|p| p.phase.is_discovery_start() || p.phase == pmtu::PmtuPhase::Lost);
             let initial_maxmtu = if needs_seed {
                 self.choose_udp_address(target)
                     .map_or(MTU, |(addr, _)| choose_initial_maxmtu(addr))
@@ -328,15 +334,9 @@ impl Daemon {
             let p = tunnel
                 .pmtu
                 .get_or_insert_with(|| PmtuState::new(now, initial_maxmtu));
-            // Re-seed even if pmtu state already exists (UDP timeout
-            // reset mtuprobes to 0). Our get_or_insert only seeds on
-            // first construction.
-            if p.phase.is_discovery_start() {
-                p.maxmtu = initial_maxmtu;
-            }
             if p.udp_confirmed {
                 let pinginterval = Duration::from_secs(u64::from(self.settings.pinginterval));
-                let actions = p.tick(now, pinginterval);
+                let actions = p.tick(now, pinginterval, initial_maxmtu);
                 for a in &actions {
                     Self::log_pmtu_action(&target_name, a);
                 }
