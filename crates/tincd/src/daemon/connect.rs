@@ -89,6 +89,9 @@ impl Daemon {
         // ACK reached — address worked. Pinned by tests/addrcache.rs.
         if let Some(oid) = conn_outgoing {
             self.confirm_outgoing_address(oid, conn_addr);
+            if let Some(a) = conn_addr {
+                self.addr_owners.insert(a, name.clone());
+            }
         }
 
         // Idempotent (peer may already be in graph from transitive
@@ -493,6 +496,15 @@ impl Daemon {
         // of bob's outgoing edges, the reverse edge's address is what that neighbour
         // reported seeing bob at. Reverseless edges (half-arrived gossip) are skipped;
         // an ungossiped bob leaves tier 2 empty.
+        //
+        // "Seen bob at" is a NAT-side view: a leaf behind hub H's
+        // masquerade is reported by every other neighbour at H's
+        // public IP with bob's UDP port, i.e. exactly H's listener
+        // (#100). `addr_owners` knows which addresses answered as
+        // whom; anything attributed to a node other than bob is
+        // dropped. Likewise an address inside the mesh's own Subnets
+        // was learnt through the tunnel; a meta connection can't
+        // bootstrap over the VPN it is meant to carry.
         let known: Vec<SocketAddr> = nid
             .into_iter()
             .flat_map(|n| self.graph.node_edges(n).iter().copied())
@@ -504,6 +516,8 @@ impl Daemon {
             // ADD_EDGE addrs are peer-authored gossip; don't let them
             // steer us at loopback/link-local.
             .filter(|sa| !addr::is_unwanted_dial_addr(sa))
+            .filter(|sa| self.addr_owners.get(sa).is_none_or(|owner| *owner == name))
+            .filter(|sa| !self.subnets.covers(sa.ip()))
             // Off-thread getaddrinfo results for `Address=` hostnames
             // are operator-authored config, not peer input — chain
             // them *after* the unwanted-addr gate so e.g.
