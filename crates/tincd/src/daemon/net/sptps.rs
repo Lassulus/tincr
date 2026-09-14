@@ -702,12 +702,17 @@ impl Daemon {
                 udp_sent: true,
                 ..TunnelSendOutcome::default()
             },
-            // Frame dropped; `handle_udp_emsgsize` already clamped the
-            // relay's bounds so the next one takes the TCP gate. For a
-            // probe `udp_emsgsize` is the miss signal for `try_tx`.
+            // Kernel PMTU shrank below the (now corrected) minmtu: this
+            // packet passed the `too_big` gate on the stale bound and is
+            // exactly what the gate would now send over TCP, so do that
+            // instead of dropping it. `tx_scratch[12..]` still holds the
+            // ciphertext. Not for probes: they measure the UDP path;
+            // their `udp_emsgsize` is the miss signal for `try_tx`.
             UdpSubmit::TooBig => TunnelSendOutcome {
+                needs_write: record_type != PKT_PROBE
+                    && self.send_sptps_tcp(to_nid, from_nid, record_type, ct, from_is_myself),
+                udp_sent: false,
                 udp_emsgsize: true,
-                ..TunnelSendOutcome::default()
             },
             UdpSubmit::Failed => TunnelSendOutcome::default(),
         }
