@@ -501,16 +501,11 @@ impl Daemon {
 
         // Edge-walk for known addresses, per retry on a fresh graph snapshot: for each
         // of bob's outgoing edges, the reverse edge's address is what that neighbour
-        // reported seeing bob at. Reverseless edges (half-arrived gossip) are skipped;
-        // an ungossiped bob leaves tier 2 empty.
-        //
-        // "Seen bob at" is a NAT-side view: a leaf behind hub H's
-        // masquerade is reported by every other neighbour at H's
-        // public IP with bob's UDP port, i.e. exactly H's listener
-        // (#100). `addr_owners` knows which addresses answered as
-        // whom; anything attributed to a node other than bob is
-        // dropped. Tunnel addresses are gated in `edge_wire_addr`
-        // (and again at dial time, for the other tiers).
+        // reported seeing bob at (reverseless = half-arrived gossip, skipped). That
+        // is a NAT-side view: a leaf behind hub H's masquerade is reported at H's
+        // public IP with bob's UDP port, i.e. H's listener (#100), so anything
+        // `addr_owners` attributes to a node other than bob is dropped. Tunnel
+        // addresses are gated in `edge_wire_addr` (and at dial time for other tiers).
         let known: Vec<SocketAddr> = nid
             .into_iter()
             .flat_map(|n| self.graph.node_edges(n).iter().copied())

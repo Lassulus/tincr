@@ -23,14 +23,11 @@ const UDP_UNREACHABLE_WARN_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Confirm a peer's UDP address: flip `udp_confirmed`, cache the
 /// `SockAddr` + sock index, mirror into the lock-free fast-path handle.
-///
 /// Gates on `cached.is_none() OR addr changed` — not just addr-change —
 /// because gossip seeds `udp_addr` while clearing `udp_addr_cached`.
-///
-/// A source inside the mesh's own Subnets is a datagram that came
-/// through the tunnel (see `daemon::endpoint`); it is authenticated
-/// and processed, but never becomes the peer's endpoint. Checked
-/// after the steady-state early return so the per-packet cost is nil.
+/// A source inside the mesh's own Subnets came through the tunnel (see
+/// `daemon::endpoint`): processed, but never becomes the endpoint.
+/// Checked after the steady-state early return, so per-packet cost is nil.
 pub(super) fn confirm_udp_addr(
     tunnels: &mut IntHashMap<NodeId, TunnelState>,
     listeners: &[ListenerSlot],
@@ -64,15 +61,13 @@ pub(super) fn confirm_udp_addr(
     }
 }
 
-/// Returns `true` for `sendmsg` errnos meaning "this destination
-/// cannot be sent to from here" — routing (`ENETUNREACH`,
-/// `EHOSTUNREACH`, `ENETDOWN`), family/source (`EAFNOSUPPORT`,
-/// `EADDRNOTAVAIL`) and policy (`EPERM`: firewall; `EIO`: Android
-/// refusing a VPN-protected socket a destination that routes back
-/// into the VPN). The reaction is the same for all: forget the
-/// address so the next send goes via the cold path or the TCP relay.
-/// `EMSGSIZE` and `EAGAIN` are handled elsewhere and are not "this
-/// address is wrong".
+/// `sendmsg` errnos meaning "this destination cannot be sent to from
+/// here": routing (`ENETUNREACH`, `EHOSTUNREACH`, `ENETDOWN`), family/
+/// source (`EAFNOSUPPORT`, `EADDRNOTAVAIL`) and policy (`EPERM`:
+/// firewall; `EIO`: Android refusing a VPN-protected socket a destination
+/// that routes back into the VPN). Same reaction for all: forget the
+/// address so the next send goes cold path or TCP relay. `EMSGSIZE`/
+/// `EAGAIN` are handled elsewhere and are not "this address is wrong".
 pub(super) fn is_udp_unreachable_errno(e: &io::Error) -> bool {
     let Some(raw) = e.raw_os_error() else {
         return false;
