@@ -20,4 +20,5 @@ mod portmap;
 mod sandbox;
 mod stress;
 mod tcp_fallback;
+mod tunnel_addr;
 mod udp_asymmetric;
