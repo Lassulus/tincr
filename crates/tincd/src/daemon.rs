@@ -545,13 +545,12 @@ pub struct Daemon {
     /// each round re-resolves (dynamic DNS).
     pub(crate) dns_hints: HashMap<String, Vec<SocketAddr>>,
 
-    /// Listener addresses proven to belong to a node: the dial target
-    /// of every ACK'd outgoing conn, and the address behind every
-    /// `ID` that named a different node than we dialled. The edge-walk
-    /// in `setup_outgoing_connection` drops a candidate for `bob`
-    /// that this table attributes to someone else: a leaf behind a
-    /// hub's NAT is gossiped at the hub's public address, and dialling
-    /// it reaches the hub (#100). In-memory only; a later ACK
+    /// Listener addresses proven to belong to a node: the dial target of
+    /// every ACK'd outgoing conn, and the address behind every `ID` that
+    /// named a different node than we dialled. The edge-walk drops a
+    /// candidate for `bob` this table attributes to someone else: a leaf
+    /// behind a hub's NAT is gossiped at the hub's public address and
+    /// dialling it reaches the hub (#100). In-memory; a later ACK
     /// overwrites, so a reassigned address heals itself.
     pub(crate) addr_owners: HashMap<SocketAddr, String>,
 
